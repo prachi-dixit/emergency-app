@@ -7,13 +7,13 @@ import { supabase } from "../lib/supabase";
    CONSTANTS
 ========================================================= */
 
-const CENTER = [17.385, 78.4867];
+const CENTER = [17.5605, 78.4550]; // City coordinates
 const PAGE_SIZE = 10;
 const ESCALATION_INTERVAL_MS = 30000;
 const TEST_INTERVAL_MS = 8000;
 
 const INCIDENT_TYPES = ["Medical", "Fire", "Accident", "Crime", "Other"];
-const STATUS_OPTIONS = ["active", "assigned", "arrived", "resolved"];
+const STATUS_OPTIONS = ["reported", "assigned", "en_route", "arrived", "resolved"];
 
 const STATUS_LABELS = {
   active: "Active",
@@ -197,7 +197,7 @@ export default function Admin() {
 
   const [showResponders, setShowResponders] = useState(true);
   const [simulationOn, setSimulationOn] = useState(false);
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(() => Date.now());
 
   /* ---------------------------------------------------------
      TOASTS
@@ -217,7 +217,6 @@ export default function Admin() {
 
   const loadData = useCallback(async (showRefresh = false) => {
     if (showRefresh) setRefreshing(true);
-    setError("");
 
     try {
       const [incidentsRes, respondersRes, eventsRes] = await Promise.all([
@@ -239,6 +238,7 @@ export default function Admin() {
       if (respondersRes.error) throw respondersRes.error;
       if (eventsRes.error) throw eventsRes.error;
 
+      setError("");
       setIncidents(incidentsRes.data || []);
       setResponders(respondersRes.data || []);
       setEvents(eventsRes.data || []);
@@ -255,8 +255,51 @@ export default function Admin() {
   }, []);
 
   useEffect(() => {
-    loadData();
-  }, [loadData]);
+    let ignore = false;
+    async function init() {
+      try {
+        const [incidentsRes, respondersRes, eventsRes] = await Promise.all([
+          supabase
+            .from("incidents")
+            .select("*")
+            .order("created_at", { ascending: false }),
+          supabase
+            .from("responders")
+            .select("*")
+            .order("name", { ascending: true }),
+          supabase
+            .from("incident_events")
+            .select("*")
+            .order("created_at", { ascending: true }),
+        ]);
+
+        if (ignore) return;
+        if (incidentsRes.error) throw incidentsRes.error;
+        if (respondersRes.error) throw respondersRes.error;
+        if (eventsRes.error) throw eventsRes.error;
+
+        setIncidents(incidentsRes.data || []);
+        setResponders(respondersRes.data || []);
+        setEvents(eventsRes.data || []);
+        setLastUpdated(Date.now());
+      } catch (err) {
+        if (ignore) return;
+        console.error("Dashboard load failed:", err);
+        setError(
+          err?.message || "Could not load dashboard data from Supabase."
+        );
+      } finally {
+        if (!ignore) {
+          setLoading(false);
+          setRefreshing(false);
+        }
+      }
+    }
+    init();
+    return () => {
+      ignore = true;
+    };
+  }, []);
 
   /* ---------------------------------------------------------
      LIVE CLOCK (keeps relative times fresh)
@@ -389,7 +432,7 @@ export default function Admin() {
         String(incident.type || "").toLowerCase().includes(query) ||
         String(incident.description || "").toLowerCase().includes(query) ||
         String(
-          responderById.get(String(incident.assigned_responder_id))?.name || ""
+          responderById.get(String((incident.assigned_to || incident.assigned_responder_id)))?.name || ""
         )
           .toLowerCase()
           .includes(query);
@@ -462,16 +505,12 @@ export default function Admin() {
     [filteredIncidents, currentPage]
   );
 
-  useEffect(() => {
+  const filterKey = `${search}|${statusFilter}|${severityFilter}|${typeFilter}|${escalatedOnly}|${hideResolved}`;
+  const [prevFilterKey, setPrevFilterKey] = useState(filterKey);
+  if (filterKey !== prevFilterKey) {
+    setPrevFilterKey(filterKey);
     setPage(1);
-  }, [
-    search,
-    statusFilter,
-    severityFilter,
-    typeFilter,
-    escalatedOnly,
-    hideResolved,
-  ]);
+  }
 
   const stats = useMemo(() => {
     const active = incidents.filter((i) => i.status !== "resolved").length;
@@ -483,7 +522,7 @@ export default function Admin() {
       (i) => i.escalated === true && i.status !== "resolved"
     ).length;
     const unassigned = incidents.filter(
-      (i) => i.status === "active" && !i.assigned_responder_id
+      (i) => (i.status === "active" || i.status === "reported") && !(i.assigned_to || i.assigned_responder_id)
     ).length;
     const resolved = incidents.filter((i) => i.status === "resolved").length;
 
@@ -709,9 +748,7 @@ export default function Admin() {
     try {
       const patch = { status: newStatus };
 
-      if (newStatus === "arrived" && !selectedIncident.arrived_at) {
-        patch.arrived_at = new Date().toISOString();
-      }
+      /* arrival timestamp captured in incident_events */
 
       const { error: updateError } = await supabase
         .from("incidents")
@@ -731,7 +768,7 @@ export default function Admin() {
       /* Free the responder once the incident is resolved */
       if (newStatus === "resolved") {
         await setResponderStatus(
-          selectedIncident.assigned_responder_id,
+          (selectedIncident.assigned_to || selectedIncident.assigned_responder_id),
           "available"
         );
       }
@@ -754,7 +791,7 @@ export default function Admin() {
     if (!selectedIncident) return;
 
     const value = responderId === "" ? null : responderId;
-    const previousId = selectedIncident.assigned_responder_id;
+    const previousId = (selectedIncident.assigned_to || selectedIncident.assigned_responder_id);
 
     if (String(value ?? "") === String(previousId ?? "")) return;
 
@@ -768,7 +805,7 @@ export default function Admin() {
 
       const { error: updateError } = await supabase
         .from("incidents")
-        .update({ assigned_responder_id: value, status: nextStatus })
+        .update({ assigned_to: value, status: nextStatus })
         .eq("id", selectedIncident.id);
 
       if (updateError) throw updateError;
@@ -819,7 +856,7 @@ export default function Admin() {
 
         const { error: rpcError } = await supabase.rpc("create_incident", {
           p_type: type,
-          p_description: "Test emergency incident created from admin dashboard.",
+          p_description: "Simulated emergency incident.",
           p_lat: CENTER[0] + jitter(),
           p_lng: CENTER[1] + jitter(),
         });
@@ -876,7 +913,7 @@ export default function Admin() {
       incident.severity,
       incident.status,
       incident.escalated ? "Yes" : "No",
-      responderById.get(String(incident.assigned_responder_id))?.name,
+      responderById.get(String((incident.assigned_to || incident.assigned_responder_id)))?.name,
       incident.lat,
       incident.lng,
       incident.created_at,
@@ -1272,7 +1309,7 @@ export default function Admin() {
                   <tbody>
                     {pagedIncidents.map((incident) => {
                       const responder = responderById.get(
-                        String(incident.assigned_responder_id)
+                        String((incident.assigned_to || incident.assigned_responder_id))
                       );
                       const isSelected = incident.id === selectedIncidentId;
 
@@ -1512,7 +1549,7 @@ export default function Admin() {
                   </label>
 
                   <select
-                    value={selectedIncident.assigned_responder_id || ""}
+                    value={(selectedIncident.assigned_to || selectedIncident.assigned_responder_id) || ""}
                     onChange={(e) => assignResponder(e.target.value)}
                     disabled={
                       assigningResponder || selectedIncident.status === "resolved"
@@ -1523,7 +1560,7 @@ export default function Admin() {
                     {responders.map((responder) => {
                       const isCurrent =
                         String(responder.id) ===
-                        String(selectedIncident.assigned_responder_id);
+                        String((selectedIncident.assigned_to || selectedIncident.assigned_responder_id));
                       const busy =
                         String(responder.status || "").toLowerCase() === "busy";
 
@@ -1541,7 +1578,7 @@ export default function Admin() {
                   </select>
 
                   {nearestResponder &&
-                    !selectedIncident.assigned_responder_id &&
+                    !(selectedIncident.assigned_to || selectedIncident.assigned_responder_id) &&
                     selectedIncident.status !== "resolved" && (
                       <button
                         onClick={() =>
@@ -1664,7 +1701,7 @@ export default function Admin() {
                   const status = String(responder.status || "").toLowerCase();
                   const currentJob = incidents.find(
                     (i) =>
-                      String(i.assigned_responder_id) === String(responder.id) &&
+                      String((i.assigned_to || i.assigned_responder_id)) === String(responder.id) &&
                       i.status !== "resolved"
                   );
 

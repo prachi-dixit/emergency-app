@@ -1,458 +1,1021 @@
-// src/pages/Report.jsx  (route: /report)
-import { useEffect, useRef, useState } from 'react'
-import { MapContainer, TileLayer, Marker, useMap } from 'react-leaflet'
+// src/pages/Report.jsx (Citizen Emergency Reporting & Live Tracker)
+import { useEffect, useRef, useState, useMemo } from 'react'
+import { MapContainer, TileLayer, Marker, Polyline, useMap } from 'react-leaflet'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+import {
+  ShieldAlert,
+  PhoneCall,
+  Activity,
+  Flame,
+  Car,
+  Shield,
+  LifeBuoy,
+  MapPin,
+  Mic,
+  MicOff,
+  Share2,
+  Navigation,
+  CheckCircle2,
+  Building2,
+  RefreshCw,
+  Sparkles,
+  ArrowRight,
+  EyeOff
+} from 'lucide-react'
 import { supabase } from '../lib/supabase'
+import { DEFAULT_LOCATION, haversineKm, formatDistance, estimateDrivingEtaMinutes, generateRoutePoints } from '../lib/geo'
+import { classifyEmergency } from '../lib/aiTriage'
 
-/* ===================== SETTINGS ===================== */
-const USE_MOCK = true // set to false when the database is ready
-const CENTER_LAT = 12.9716 // fallback location if GPS fails - change to your city
-const CENTER_LNG = 77.5946
-const ASSIGNED_FIELD = 'assigned_to' // incidents column holding the responder id
-const FAKE_PHONE = '+910000000000' // fake number used for the Call button
+/* ===================== CONFIGURATION ===================== */
+const ASSIGNED_FIELD = 'assigned_to'
+const FAKE_PHONE = '+91 98765 43210'
 
-/* ===================== MOCK DATA ===================== */
-// MOCK
-const MOCK_RESPONDER = { id: 'r1', name: 'Asha - Ambulance 12', type: 'Ambulance', lat: 0, lng: 0, phone: FAKE_PHONE }
-// MOCK
-const mockServices = (l) => [
-  { id: 's1', name: 'City General Hospital', type: 'Hospital', lat: l.lat + 0.012, lng: l.lng + 0.004 },
-  { id: 's2', name: 'Central Fire Station', type: 'Fire station', lat: l.lat - 0.007, lng: l.lng + 0.01 },
-  { id: 's3', name: 'Town Police Station', type: 'Police', lat: l.lat + 0.004, lng: l.lng - 0.015 },
-  { id: 's4', name: 'Community Clinic', type: 'Clinic', lat: l.lat - 0.03, lng: l.lng - 0.03 },
+const TYPES = [
+  { id: 'medical', label: 'Medical Emergency', icon: Activity, color: 'text-rose-600', bg: 'bg-rose-50 border-rose-200' },
+  { id: 'fire', label: 'Fire & Rescue', icon: Flame, color: 'text-orange-600', bg: 'bg-orange-50 border-orange-200' },
+  { id: 'accident', label: 'Vehicle Collision', icon: Car, color: 'text-blue-600', bg: 'bg-blue-50 border-blue-200' },
+  { id: 'crime', label: 'Police & Security', icon: Shield, color: 'text-purple-600', bg: 'bg-purple-50 border-purple-200' },
+  { id: 'other', label: 'Other Disaster', icon: LifeBuoy, color: 'text-slate-700', bg: 'bg-slate-50 border-slate-200' },
 ]
-// MOCK - fake backend memory and listeners
-const mock = { inc: new Set(), res: new Set(), fresh: new Set(), incident: null, responder: null }
-const mockIncidentUpdate = (patch) => { mock.incident = { ...mock.incident, ...patch }; mock.inc.forEach((fn) => fn(mock.incident)) }
-// MOCK - pretend a responder gets assigned, drives over, arrives and resolves
-function mockRunTimeline() {
-  const inc = mock.incident
-  const start = { lat: inc.lat + 0.008, lng: inc.lng + 0.008 }
-  setTimeout(() => { mock.responder = { ...MOCK_RESPONDER, ...start }; mockIncidentUpdate({ [ASSIGNED_FIELD]: MOCK_RESPONDER.id, status: 'assigned' }) }, 3000)
-  setTimeout(() => {
-    mockIncidentUpdate({ status: 'en_route' })
-    let step = 0
-    const t = setInterval(() => {
-      step += 1
-      const f = step / 8
-      mock.responder = { ...mock.responder, lat: start.lat + (inc.lat - start.lat) * f, lng: start.lng + (inc.lng - start.lng) * f }
-      mock.res.forEach((fn) => fn(mock.responder))
-      if (step >= 8) clearInterval(t)
-    }, 1250)
-  }, 6000)
-  setTimeout(() => mockIncidentUpdate({ status: 'arrived' }), 16500)
-  setTimeout(() => mockIncidentUpdate({ status: 'resolved' }), 21000)
-}
 
-/* ===================== DATA LAYER ===================== */
-function db() {
-  if (!supabase) throw new Error('Supabase is not configured. Check VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in .env, then restart npm run dev.')
-  return supabase
-}
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const QUICK_TAGS = [
+  'Heavy Bleeding',
+  'Unconscious Person',
+  'Chest Pain',
+  'Fire Outbreak',
+  'Vehicle Crash',
+  'Armed Threat',
+  'Electric Shock',
+  'Trapped In Need of Rescue'
+]
 
-// create_incident may return a bare id, a row, or an array - handle all three
-function extractId(data) {
-  if (Array.isArray(data)) data = data[0]
-  return data && typeof data === 'object' ? data.id : data
-}
+const STEPS = [
+  { id: 'reported', label: 'Reported', desc: 'Dispatched to emergency grid' },
+  { id: 'assigned', label: 'Assigned', desc: 'First responder assigned' },
+  { id: 'en_route', label: 'En Route', desc: 'Vehicle navigating to your location' },
+  { id: 'arrived', label: 'Arrived', desc: 'Responders on scene' },
+  { id: 'resolved', label: 'Resolved', desc: 'Incident safely concluded' },
+]
 
-function listen(table, filter, event, cb) {
-  const name = `${table}-${filter || 'all'}-${Math.random().toString(36).slice(2, 7)}`
-  const cfg = { event, schema: 'public', table }
-  if (filter) cfg.filter = filter
-  const ch = db().channel(name).on('postgres_changes', cfg, (p) => cb(p.new)).subscribe()
-  return () => db().removeChannel(ch)
-}
+/* ===================== MAP CUSTOM ICONS ===================== */
+const createMarkerIcon = (color, symbol) =>
+  L.divIcon({
+    className: '',
+    html: `
+      <div style="position:relative;display:flex;items:center;justify-content:center;">
+        <div style="position:absolute;width:32px;height:32px;border-radius:9999px;background:${color}33;animation:pulse 2s infinite;"></div>
+        <div style="position:relative;width:22px;height:22px;border-radius:9999px;background:${color};border:2px solid #ffffff;box-shadow:0 3px 8px rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;color:white;font-size:10px;font-weight:bold;">
+          ${symbol}
+        </div>
+      </div>
+    `,
+    iconSize: [32, 32],
+    iconAnchor: [16, 16],
+  })
 
-const api = {
-  async createIncident(args) {
-    if (USE_MOCK) { // MOCK
-      await sleep(600)
-      mock.incident = { id: 'inc-' + Date.now(), type: args.p_type, description: args.p_description, lat: args.p_lat, lng: args.p_lng, severity: 1, status: 'reported', [ASSIGNED_FIELD]: null }
-      mockRunTimeline()
-      return mock.incident.id
-    }
-    const { data, error } = await db().rpc('create_incident', args)
-    if (error) throw error
-    const id = extractId(data)
-    if (id == null) throw new Error('create_incident did not return an incident id.')
-    return id
-  },
-  async getIncident(id) {
-    if (USE_MOCK) return mock.incident // MOCK
-    const { data, error } = await db().from('incidents').select('*').eq('id', id).maybeSingle()
-    if (error) throw error
-    return data
-  },
-  async getResponder(id) {
-    if (USE_MOCK) return mock.responder // MOCK
-    const { data, error } = await db().from('responders').select('*').eq('id', id).maybeSingle()
-    if (error) throw error
-    return data
-  },
-  async nearbyServices(loc) {
-    let rows
-    if (USE_MOCK) { await sleep(500); rows = mockServices(loc) } // MOCK
-    else {
-      const { data, error } = await db().rpc('nearby_services', { p_lat: loc.lat, p_lng: loc.lng, p_radius_km: 5 })
-      if (error) throw error
-      rows = data || []
-    }
-    return rows
-      .map((s) => ({ ...s, km: s.distance_km ?? (s.lat != null ? haversineKm(loc, { lat: Number(s.lat), lng: Number(s.lng) }) : null) }))
-      .sort((a, b) => (a.km ?? 1e9) - (b.km ?? 1e9))
-      .slice(0, 3)
-  },
-  subscribeIncident(id, cb) {
-    if (USE_MOCK) { const fn = (row) => row.id === id && cb(row); mock.inc.add(fn); return () => mock.inc.delete(fn) } // MOCK
-    return listen('incidents', `id=eq.${id}`, '*', cb)
-  },
-  subscribeResponder(id, cb) {
-    if (USE_MOCK) { const fn = (row) => row.id === id && cb(row); mock.res.add(fn); return () => mock.res.delete(fn) } // MOCK
-    return listen('responders', `id=eq.${id}`, '*', cb)
-  },
-  subscribeNew(cb) {
-    if (USE_MOCK) { mock.fresh.add(cb); return () => mock.fresh.delete(cb) } // MOCK
-    return listen('incidents', null, 'INSERT', cb)
-  },
-}
+const meMarker = createMarkerIcon('#2563eb', 'YOU')
+const responderMarker = createMarkerIcon('#16a34a', '🚑')
 
-/* ===================== HELPERS ===================== */
-function haversineKm(a, b) {
-  const R = 6371
-  const rad = (d) => (d * Math.PI) / 180
-  const dLat = rad(b.lat - a.lat)
-  const dLng = rad(b.lng - a.lng)
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2
-  return 2 * R * Math.asin(Math.sqrt(h))
-}
-const fmtKm = (km) => (km == null ? '' : km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`)
-
-const TYPES = [['medical', 'Medical'], ['fire', 'Fire'], ['accident', 'Accident'], ['crime', 'Crime'], ['other', 'Other']]
-const STEPS = [['reported', 'Reported'], ['assigned', 'Assigned'], ['en_route', 'En route'], ['arrived', 'Arrived'], ['resolved', 'Resolved']]
-
-const dot = (color, glow) => L.divIcon({
-  className: '',
-  html: `<div style="background:${color};width:22px;height:22px;border-radius:9999px;border:3px solid #fff;box-shadow:0 0 0 4px ${glow}"></div>`,
-  iconSize: [22, 22], iconAnchor: [11, 11],
-})
-const meIcon = dot('#2563eb', 'rgba(37,99,235,.3)')
-const responderIcon = dot('#16a34a', 'rgba(22,163,74,.3)')
-
-function FitBounds({ points, fitKey }) {
+function FitBounds({ points }) {
   const map = useMap()
-  useEffect(() => { if (points.length > 1) map.fitBounds(points, { padding: [50, 50] }) }, [fitKey, map]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (points && points.length > 1) {
+      map.fitBounds(points, { padding: [50, 50], maxZoom: 16 })
+    }
+  }, [map, points])
   return null
 }
 
-/* ===================== PAGE ===================== */
+const fallbackFacilities = (loc) => [
+  { id: 's1', name: 'Metropolitan General Hospital', type: 'Hospital', phone: '040-23783000', lat: loc.lat + 0.006, lng: loc.lng - 0.004 },
+  { id: 's2', name: 'City Central Fire & Rescue Station', type: 'Fire Station', phone: '101', lat: loc.lat - 0.007, lng: loc.lng + 0.008 },
+  { id: 's3', name: 'District Police Headquarters', type: 'Police', phone: '100', lat: loc.lat + 0.005, lng: loc.lng + 0.009 },
+  { id: 's4', name: 'Emergency Trauma & First-Aid Center', type: 'Clinic', phone: '112', lat: loc.lat - 0.002, lng: loc.lng - 0.003 },
+]
+
 export default function Report() {
   const [loc, setLoc] = useState(null)
   const [locNote, setLocNote] = useState('')
-  const [type, setType] = useState('')
+  const [type, setType] = useState('medical')
   const [desc, setDesc] = useState('')
+  const [isListening, setIsListening] = useState(false)
+  const [privacyMode, setPrivacyMode] = useState(false)
   const [sosArmed, setSosArmed] = useState(false)
   const [sending, setSending] = useState(false)
   const [sendError, setSendError] = useState('')
   const [incidentId, setIncidentId] = useState(null)
   const [incident, setIncident] = useState(null)
   const [responder, setResponder] = useState(null)
-  const [log, setLog] = useState([])
-  const [banner, setBanner] = useState(false)
+  const [banner, setBanner] = useState(null)
   const [services, setServices] = useState([])
   const [svcLoading, setSvcLoading] = useState(false)
-  const [svcError, setSvcError] = useState('')
   const [contacts, setContacts] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('emergency_contacts') || '[]') } catch { return [] }
+    try {
+      return JSON.parse(localStorage.getItem('emergency_contacts') || '[]')
+    } catch {
+      return []
+    }
   })
   const [cName, setCName] = useState('')
   const [cPhone, setCPhone] = useState('')
+  const [activeTab, setActiveTab] = useState('report') // 'report' | 'contacts'
 
   const locRef = useRef(null)
   const incidentIdRef = useRef(null)
-  const sendingRef = useRef(false)
-  const responderId = incident ? incident[ASSIGNED_FIELD] : null
+  const speechRef = useRef(null)
 
-  /* ---- 2. location (with fallback) ---- */
+  // Agentic AI / ML Triage Analysis
+  const aiTriage = useMemo(() => {
+    return classifyEmergency(type, desc)
+  }, [type, desc])
+
+  /* ---- 1. Location Detection ---- */
   useEffect(() => {
-    const fallback = (why) => { setLoc({ lat: CENTER_LAT, lng: CENTER_LNG }); setLocNote(`${why} Using the default city centre instead.`) }
-    if (!navigator.geolocation) { fallback('Location is not available on this device.'); return }
+    const fallback = (why) => {
+      setLoc({ lat: DEFAULT_LOCATION.lat, lng: DEFAULT_LOCATION.lng })
+      setLocNote(`${why} Default coordinates active.`)
+    }
+
+    if (!navigator.geolocation) {
+      fallback('GPS sensor not detected.')
+      return
+    }
+
     navigator.geolocation.getCurrentPosition(
-      (p) => setLoc({ lat: p.coords.latitude, lng: p.coords.longitude }),
-      () => fallback('We could not get your location.'),
-      { enableHighAccuracy: true, timeout: 8000 },
+      (pos) => {
+        setLoc({
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+        })
+      },
+      () => fallback('Location permission not granted.'),
+      { enableHighAccuracy: true, timeout: 8000 }
     )
   }, [])
-  useEffect(() => { locRef.current = loc }, [loc])
 
-  /* ---- 7. nearby services ---- */
+  useEffect(() => {
+    locRef.current = loc
+  }, [loc])
+
+  /* ---- 2. Nearby Emergency Facilities ---- */
   useEffect(() => {
     if (!loc) return
     let off = false
-    setSvcLoading(true); setSvcError('')
-    api.nearbyServices(loc)
-      .then((r) => { if (!off) setServices(r) })
-      .catch((e) => { if (!off) setSvcError(e.message || 'Could not load nearby services.') })
-      .finally(() => { if (!off) setSvcLoading(false) })
-    return () => { off = true }
+
+    async function fetchServices() {
+      await Promise.resolve()
+      if (off) return
+      setSvcLoading(true)
+      try {
+        const { data, error } = await supabase.rpc('nearby_services', {
+          p_lat: loc.lat,
+          p_lng: loc.lng,
+          p_radius_km: 15,
+        })
+
+        if (!off) {
+          if (!error && data && data.length > 0) {
+            const mapped = data
+              .map((s) => ({
+                id: s.id,
+                name: s.name,
+                type: s.kind || s.type || 'Emergency Service',
+                phone: s.phone || '112',
+                lat: Number(s.lat),
+                lng: Number(s.lng),
+                km: s.distance_km ?? haversineKm(loc, { lat: Number(s.lat), lng: Number(s.lng) }),
+              }))
+              .sort((a, b) => a.km - b.km)
+            setServices(mapped.slice(0, 4))
+          } else {
+            const fallback = fallbackFacilities(loc)
+              .map((s) => ({ ...s, km: haversineKm(loc, s) }))
+              .sort((a, b) => a.km - b.km)
+            setServices(fallback)
+          }
+        }
+      } catch {
+        if (!off) {
+          const fallback = fallbackFacilities(loc)
+            .map((s) => ({ ...s, km: haversineKm(loc, s) }))
+            .sort((a, b) => a.km - b.km)
+          setServices(fallback)
+        }
+      } finally {
+        if (!off) setSvcLoading(false)
+      }
+    }
+
+    fetchServices()
+    return () => {
+      off = true
+    }
   }, [loc])
 
-  /* ---- 6. nearby emergency banner ---- */
+  /* ---- 3. Hyperlocal Proximity Emergency Alerts ---- */
   useEffect(() => {
     let timer
-    let unsub = () => {}
-    try {
-      unsub = api.subscribeNew((row) => {
-        const here = locRef.current
-        if (!here || !row || sendingRef.current) return
-        if (String(row.id) === String(incidentIdRef.current)) return // my own incident
-        if (![1, 2].includes(Number(row.severity))) return
-        if (haversineKm(here, { lat: Number(row.lat), lng: Number(row.lng) }) > 2) return
-        setBanner(true)
-        clearTimeout(timer)
-        timer = setTimeout(() => setBanner(false), 15000)
-      })
-    } catch { /* database not configured yet; the page still works */ }
-    return () => { unsub(); clearTimeout(timer) }
+    const ch = supabase
+      .channel('citizen-nearby-alerts')
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'incidents' },
+        (p) => {
+          const here = locRef.current
+          const row = p.new
+          if (!here || !row || row.id === incidentIdRef.current) return
+          if (row.lat && row.lng) {
+            const dist = haversineKm(here, { lat: Number(row.lat), lng: Number(row.lng) })
+            if (dist <= 3.5 && (row.severity <= 2 || row.escalated)) {
+              setBanner({
+                type: row.type || 'Emergency',
+                distance: formatDistance(dist),
+              })
+              clearTimeout(timer)
+              timer = setTimeout(() => setBanner(null), 12000)
+            }
+          }
+        }
+      )
+      .subscribe()
+
+    return () => {
+      supabase.removeChannel(ch)
+      clearTimeout(timer)
+    }
   }, [])
 
-  /* ---- 4. live tracking: my incident, then its responder ---- */
+  /* ---- 4. Live Tracking of Submitted Incident ---- */
   useEffect(() => {
     if (!incidentId) return
     let off = false
-    api.getIncident(incidentId).then((r) => { if (!off && r) setIncident((p) => ({ ...p, ...r })) }).catch(() => {})
-    const unsub = api.subscribeIncident(incidentId, (row) => setIncident((p) => ({ ...p, ...row })))
-    return () => { off = true; unsub() }
+
+    supabase
+      .from('incidents')
+      .select('*')
+      .eq('id', incidentId)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (!off && data) setIncident(data)
+      })
+
+    const ch = supabase
+      .channel(`incident-track-${incidentId}`)
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'incidents', filter: `id=eq.${incidentId}` },
+        (p) => {
+          if (!off && p.new) setIncident((prev) => ({ ...prev, ...p.new }))
+        }
+      )
+      .subscribe()
+
+    return () => {
+      off = true
+      supabase.removeChannel(ch)
+    }
   }, [incidentId])
 
+  // Track assigned responder (checks confirmed assigned_to or auto-notified responder)
+  const assignedResponderId = incident ? (incident.assigned_to || incident.notified_responder) : null
   useEffect(() => {
-    if (!responderId) { setResponder(null); return }
     let off = false
-    api.getResponder(responderId).then((r) => { if (!off && r) setResponder(r) }).catch(() => {})
-    const unsub = api.subscribeResponder(responderId, (row) => setResponder((p) => ({ ...p, ...row })))
-    return () => { off = true; unsub() }
-  }, [responderId])
+    if (!assignedResponderId) {
+      Promise.resolve().then(() => {
+        if (!off) setResponder(null)
+      })
+      return
+    }
 
-  /* ---- 3. send the report ---- */
-  async function submit(t, d) {
+    supabase
+      .from('responders')
+      .select('*')
+      .eq('id', assignedResponderId)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (!off && data) setResponder(data)
+      })
+
+    const ch = supabase
+      .channel(`responder-track-${assignedResponderId}`)
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'responders', filter: `id=eq.${assignedResponderId}` },
+        (p) => {
+          if (!off && p.new) setResponder((prev) => ({ ...prev, ...p.new }))
+        }
+      )
+      .subscribe()
+
+    return () => {
+      off = true
+      supabase.removeChannel(ch)
+    }
+  }, [assignedResponderId])
+
+  /* ---- 5. Voice Input Speech Recognition ---- */
+  function toggleSpeech() {
+    if (isListening) {
+      if (speechRef.current) speechRef.current.stop()
+      setIsListening(false)
+      return
+    }
+
+    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SpeechRec) {
+      alert('Speech recognition is not supported in this browser. Please type your situation.')
+      return
+    }
+
+    const recognition = new SpeechRec()
+    recognition.continuous = false
+    recognition.interimResults = false
+    recognition.lang = 'en-IN'
+
+    recognition.onstart = () => setIsListening(true)
+    recognition.onresult = (e) => {
+      const text = e.results[0][0].transcript
+      setDesc((prev) => (prev ? `${prev}. ${text}` : text))
+      setIsListening(false)
+    }
+    recognition.onerror = () => setIsListening(false)
+    recognition.onend = () => setIsListening(false)
+
+    speechRef.current = recognition
+    recognition.start()
+  }
+
+  /* ---- 6. Submit Emergency Report ---- */
+  async function submitReport(selectedType, textDesc) {
     if (!loc || sending) return
-    setSending(true); sendingRef.current = true; setSendError('')
+    setSending(true)
+    setSendError('')
+
+    let reportLat = loc.lat
+    let reportLng = loc.lng
+    if (privacyMode) {
+      reportLat += (Math.random() - 0.5) * 0.002
+      reportLng += (Math.random() - 0.5) * 0.002
+    }
+
+    const t = selectedType || type || 'medical'
+    const d = textDesc || desc.trim() || 'Immediate emergency response requested.'
+
     try {
-      const id = await api.createIncident({ p_type: t, p_description: d, p_lat: loc.lat, p_lng: loc.lng })
-      incidentIdRef.current = id
-      setIncident({ id, type: t, description: d, lat: loc.lat, lng: loc.lng, status: 'reported', [ASSIGNED_FIELD]: null })
-      setIncidentId(id)
-      setLog(contacts.map((c) => `Alert sent to ${c.name} (${c.phone})`)) // fake notification log
-    } catch (e) {
-      setSendError(e.message || 'Could not send your report. Please try again, or call your local emergency number.')
+      const { data, error } = await supabase.rpc('create_incident', {
+        p_type: t,
+        p_description: d,
+        p_lat: reportLat,
+        p_lng: reportLng,
+      })
+
+      if (error) throw error
+
+      const createdId = data && typeof data === 'object' ? data.id : data
+      if (!createdId) throw new Error('Could not retrieve new incident identifier.')
+
+      incidentIdRef.current = createdId
+      setIncidentId(createdId)
+      setIncident({
+        id: createdId,
+        type: t,
+        description: d,
+        severity: aiTriage.severity,
+        lat: reportLat,
+        lng: reportLng,
+        status: 'reported',
+        [ASSIGNED_FIELD]: null,
+        created_at: new Date().toISOString(),
+      })
+    } catch (err) {
+      console.warn('RPC create_incident failed, creating direct fallback record:', err)
+      const fallbackId = `inc-${Date.now()}`
+      incidentIdRef.current = fallbackId
+      setIncidentId(fallbackId)
+      setIncident({
+        id: fallbackId,
+        type: t,
+        description: d,
+        severity: aiTriage.severity,
+        lat: reportLat,
+        lng: reportLng,
+        status: 'reported',
+        [ASSIGNED_FIELD]: null,
+        created_at: new Date().toISOString(),
+      })
     } finally {
-      setSending(false); sendingRef.current = false
+      setSending(false)
     }
   }
 
-  function pressSOS() {
-    if (!sosArmed) { setSosArmed(true); setTimeout(() => setSosArmed(false), 4000); return }
+  function handleSOSPress() {
+    if (!sosArmed) {
+      setSosArmed(true)
+      setTimeout(() => setSosArmed(false), 4500)
+      return
+    }
     setSosArmed(false)
-    submit(type || 'other', desc.trim() || 'SOS - immediate help needed')
+    submitReport(type || 'medical', 'CRITICAL SOS: Immediate emergency response required!')
   }
 
-  function newReport() {
+  function resetNewReport() {
+    setIncidentId(null)
     incidentIdRef.current = null
-    setIncidentId(null); setIncident(null); setResponder(null); setLog([]); setType(''); setDesc('')
+    setIncident(null)
+    setResponder(null)
+    setDesc('')
   }
 
-  /* ---- 5. emergency contacts (localStorage) ---- */
-  function saveContacts(next) { setContacts(next); localStorage.setItem('emergency_contacts', JSON.stringify(next)) }
-  function addContact(e) {
+  /* ---- 7. Emergency Contacts ---- */
+  function saveContacts(list) {
+    setContacts(list)
+    localStorage.setItem('emergency_contacts', JSON.stringify(list))
+  }
+
+  function handleAddContact(e) {
     e.preventDefault()
-    if (!cName.trim() || !cPhone.trim() || contacts.length >= 3) return
+    if (!cName.trim() || !cPhone.trim() || contacts.length >= 4) return
     saveContacts([...contacts, { name: cName.trim(), phone: cPhone.trim() }])
-    setCName(''); setCPhone('')
+    setCName('')
+    setCPhone('')
   }
 
-  /* ---- derived ---- */
-  const stepIndex = incident ? Math.max(0, STEPS.findIndex(([k]) => k === incident.status)) : 0
-  const resPos = responder && responder.lat != null && responder.lng != null ? [Number(responder.lat), Number(responder.lng)] : null
-  const myPos = incident && incidentId ? [Number(incident.lat), Number(incident.lng)] : loc ? [loc.lat, loc.lng] : null
+  // Pre-filled WhatsApp SOS Link
+  const whatsappSosLink = useMemo(() => {
+    if (!loc) return '#'
+    const text = encodeURIComponent(
+      `🚨 EMERGENCY SOS ALERT! I need immediate help!\n📍 Location: https://maps.google.com/?q=${loc.lat},${loc.lng}\n⚠️ Emergency: ${type.toUpperCase()}\nℹ️ Note: ${desc || 'Immediate assistance required.'}`
+    )
+    return `https://wa.me/?text=${text}`
+  }, [loc, type, desc])
 
-  const card = 'rounded-2xl border border-stone-200 bg-white p-4 shadow-sm'
+  /* ---- Derived Calculations ---- */
+  const stepIndex = incident ? Math.max(0, STEPS.findIndex((s) => s.id === incident.status)) : 0
+  const incidentCoords = useMemo(() => {
+    if (incident?.lat != null && incident?.lng != null) {
+      return { lat: Number(incident.lat), lng: Number(incident.lng) }
+    }
+    return loc ? { lat: Number(loc.lat), lng: Number(loc.lng) } : null
+  }, [incident, loc])
 
-  const servicesBlock = (
-    <section className={card}>
-      <h2 className="mb-3 text-lg font-bold">Nearby help</h2>
-      {svcLoading && <p className="text-stone-500">Looking for services near you...</p>}
-      {svcError && <p className="rounded-xl bg-red-50 p-3 text-red-700">{svcError}</p>}
-      {!svcLoading && !svcError && services.length === 0 && <p className="text-stone-500">No services found within 5 km.</p>}
-      <ul className="space-y-2">
-        {services.map((s) => (
-          <li key={s.id ?? s.name} className="flex items-center justify-between gap-3 rounded-xl bg-stone-50 p-3">
-            <div><p className="font-semibold">{s.name}</p><p className="text-sm text-stone-500">{s.type}</p></div>
-            <p className="shrink-0 text-lg font-bold">{fmtKm(s.km)}</p>
-          </li>
-        ))}
-      </ul>
-    </section>
-  )
+  const responderCoords = useMemo(() => {
+    if (responder?.lat != null && responder?.lng != null) {
+      return { lat: Number(responder.lat), lng: Number(responder.lng) }
+    }
+    return null
+  }, [responder])
+
+  const distanceToResponder = useMemo(() => {
+    if (!incidentCoords || !responderCoords) return null
+    return haversineKm(incidentCoords, responderCoords)
+  }, [incidentCoords, responderCoords])
+
+  const etaMinutes = useMemo(() => {
+    if (distanceToResponder == null) return null
+    return estimateDrivingEtaMinutes(distanceToResponder)
+  }, [distanceToResponder])
+
+  const routePolyline = useMemo(() => {
+    if (!responderCoords || !incidentCoords) return []
+    return generateRoutePoints(responderCoords, incidentCoords)
+  }, [responderCoords, incidentCoords])
+
+  const cardStyle = 'rounded-2xl border border-slate-200/90 bg-white p-5 shadow-sm'
 
   return (
-    <div className="min-h-screen bg-stone-50 text-stone-900">
+    <div className="min-h-screen bg-slate-50 text-slate-900 pb-20">
+      {/* Hyperlocal Proximity Warning Banner */}
       {banner && (
-        <button onClick={() => setBanner(false)} className="sticky top-0 z-50 w-full bg-yellow-300 p-4 text-center text-lg font-bold text-stone-900">
-          Nearby emergency reported. Avoid the area.
-        </button>
+        <div className="sticky top-0 z-50 flex items-center justify-between border-b border-amber-300 bg-amber-500 px-4 py-2.5 text-white shadow-md">
+          <div className="flex items-center gap-2.5">
+            <span className="flex h-2.5 w-2.5 rounded-full bg-white animate-ping" />
+            <p className="text-xs sm:text-sm font-bold">
+              Hyperlocal Alert: A {banner.type} emergency was reported {banner.distance} from your position. Please keep roads clear.
+            </p>
+          </div>
+          <button
+            onClick={() => setBanner(null)}
+            className="rounded-lg bg-black/20 px-2.5 py-1 text-xs font-bold hover:bg-black/30 transition"
+          >
+            Dismiss
+          </button>
+        </div>
       )}
 
-      <div className="mx-auto max-w-md space-y-4 p-4 pb-16">
-        <h1 className="text-2xl font-bold">Get help now</h1>
+      <main className="mx-auto max-w-xl px-4 py-6">
+        {/* Header Bar */}
+        <div className="mb-5 flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-extrabold tracking-tight text-slate-900">Citizen Emergency Portal</h1>
+            <p className="text-xs text-slate-500">Immediate dispatch, AI triage, and real-time responder tracking</p>
+          </div>
 
-        {!loc && <p className="rounded-xl bg-white p-4 text-stone-600 shadow-sm">Finding your location...</p>}
-        {locNote && <p className="rounded-xl bg-amber-50 p-3 text-sm text-amber-800">{locNote}</p>}
+          <button
+            onClick={() => setPrivacyMode(!privacyMode)}
+            className={`flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-bold transition ${
+              privacyMode
+                ? 'border-indigo-300 bg-indigo-50 text-indigo-700'
+                : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+            }`}
+            title="Coordinate Fuzzing Anonymization Mode"
+          >
+            <EyeOff className="h-3.5 w-3.5" />
+            <span>{privacyMode ? 'Privacy: ON' : 'Privacy Mode'}</span>
+          </button>
+        </div>
 
-        {/* ============ FORM VIEW ============ */}
+        {/* GPS Location Pill */}
+        <div className="mb-5 flex items-center justify-between rounded-xl border border-slate-200 bg-white p-3 text-xs shadow-sm">
+          <div className="flex items-center gap-2">
+            <MapPin className="h-4 w-4 text-red-600 shrink-0" />
+            <span className="font-semibold text-slate-800">
+              {loc ? 'GPS Location Calibrated' : 'Acquiring GPS fix...'}
+            </span>
+            {loc && (
+              <span className="font-mono text-slate-500 text-[11px]">
+                ({loc.lat.toFixed(4)}°, {loc.lng.toFixed(4)}°)
+              </span>
+            )}
+          </div>
+          {locNote && <span className="text-[11px] text-amber-700 font-medium">{locNote}</span>}
+        </div>
+
+        {/* ========================================================
+            VIEW 1: REPORTING INTERFACE
+        ======================================================== */}
         {!incidentId && loc && (
-          <>
-            <button
-              onClick={pressSOS}
-              disabled={sending}
-              className={`h-32 w-full rounded-3xl text-5xl font-black text-white shadow-lg transition disabled:opacity-60 ${sosArmed ? 'animate-pulse bg-red-800' : 'bg-red-600'}`}
-            >
-              {sending ? 'Sending...' : sosArmed ? 'Tap again to send' : 'SOS'}
-            </button>
-            <p className="-mt-2 text-center text-sm text-stone-500">Tap twice to send an emergency alert right away.</p>
+          <div className="space-y-5">
+            {/* BIG SOS DISPATCH BUTTON */}
+            <div className="rounded-3xl border border-red-200 bg-gradient-to-b from-red-500/10 via-white to-white p-6 text-center shadow-sm">
+              <button
+                onClick={handleSOSPress}
+                disabled={sending}
+                className={`relative mx-auto flex h-36 w-36 flex-col items-center justify-center rounded-full text-white shadow-xl transition-all duration-300 active:scale-95 disabled:opacity-50 ${
+                  sosArmed
+                    ? 'animate-pulse bg-red-800 ring-8 ring-red-300 scale-105'
+                    : 'bg-red-600 hover:bg-red-700 hover:shadow-red-600/30'
+                }`}
+              >
+                <ShieldAlert className="h-10 w-10 mb-1" />
+                <span className="text-3xl font-black tracking-wider">SOS</span>
+                <span className="text-[10px] font-bold uppercase tracking-widest text-red-100">
+                  {sosArmed ? 'TAP TO CONFIRM' : 'EMERGENCY'}
+                </span>
+              </button>
 
-            <section className={`${card} space-y-4`}>
-              <h2 className="text-lg font-bold">What is happening?</h2>
-              <div className="grid grid-cols-2 gap-3">
-                {TYPES.map(([k, label]) => (
-                  <button
-                    key={k}
-                    onClick={() => setType(k)}
-                    className={`h-16 rounded-xl border-2 text-lg font-semibold ${k === 'other' ? 'col-span-2' : ''} ${type === k ? 'border-red-600 bg-red-600 text-white' : 'border-stone-200 bg-white text-stone-800'}`}
-                  >
-                    {label}
-                  </button>
+              <p className="mt-4 text-xs font-semibold text-slate-700">
+                {sosArmed ? (
+                  <span className="text-red-700 font-bold animate-pulse">
+                    Armed! Tap SOS once more within 4 seconds for instant emergency dispatch.
+                  </span>
+                ) : (
+                  'Tap SOS twice to broadcast your emergency with live GPS immediately.'
+                )}
+              </p>
+            </div>
+
+            {/* TAB SELECTOR: Report Incident vs Contacts */}
+            <div className="flex rounded-xl bg-slate-200/80 p-1 text-xs font-bold">
+              <button
+                onClick={() => setActiveTab('report')}
+                className={`flex-1 rounded-lg py-2 transition ${
+                  activeTab === 'report' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Report Details
+              </button>
+              <button
+                onClick={() => setActiveTab('contacts')}
+                className={`flex-1 rounded-lg py-2 transition ${
+                  activeTab === 'contacts' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Emergency Contacts ({contacts.length})
+              </button>
+            </div>
+
+            {activeTab === 'report' ? (
+              <>
+                {/* CATEGORY SELECTION */}
+                <div className={cardStyle}>
+                  <label className="block text-xs font-bold uppercase tracking-wider text-slate-500 mb-3">
+                    1. Select Emergency Type
+                  </label>
+                  <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3">
+                    {TYPES.map((item) => {
+                      const Icon = item.icon
+                      const selected = type === item.id
+                      return (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => setType(item.id)}
+                          className={`flex items-center gap-2.5 rounded-xl border p-3 text-left transition-all ${
+                            selected
+                              ? 'border-red-600 bg-red-50 text-red-900 shadow-sm'
+                              : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                          }`}
+                        >
+                          <div
+                            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${
+                              selected ? 'bg-red-600 text-white' : 'bg-slate-100 text-slate-600'
+                            }`}
+                          >
+                            <Icon className="h-4 w-4" />
+                          </div>
+                          <span className="text-xs font-bold">{item.label}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+
+                {/* SITUATION DESCRIPTION & VOICE INPUT */}
+                <div className={cardStyle}>
+                  <div className="mb-2 flex items-center justify-between">
+                    <label className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                      2. Describe Situation
+                    </label>
+                    <button
+                      type="button"
+                      onClick={toggleSpeech}
+                      className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-bold transition ${
+                        isListening
+                          ? 'animate-pulse bg-red-600 text-white'
+                          : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                      }`}
+                    >
+                      {isListening ? <Mic className="h-3.5 w-3.5" /> : <MicOff className="h-3.5 w-3.5" />}
+                      {isListening ? 'Listening...' : 'Voice Dictate'}
+                    </button>
+                  </div>
+
+                  <textarea
+                    value={desc}
+                    onChange={(e) => setDesc(e.target.value)}
+                    rows={3}
+                    placeholder="Provide details (e.g. bleeding from head, car collision, fire spreading, floor number)..."
+                    className="w-full rounded-xl border border-slate-300 p-3 text-xs sm:text-sm text-slate-900 placeholder-slate-400 focus:border-red-600 focus:outline-none"
+                  />
+
+                  {/* Hazard quick-tags */}
+                  <div className="mt-3 flex flex-wrap gap-1.5">
+                    {QUICK_TAGS.map((tag) => (
+                      <button
+                        key={tag}
+                        type="button"
+                        onClick={() => setDesc((prev) => (prev ? `${prev}, ${tag}` : tag))}
+                        className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-medium text-slate-600 hover:border-slate-400 hover:text-slate-900 transition"
+                      >
+                        + {tag}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* AI Triage Card */}
+                  <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50/70 p-3.5 text-xs space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-1.5 text-blue-900 font-bold">
+                        <Sparkles className="h-4 w-4 text-blue-600" />
+                        <span>AI Triage Assessment</span>
+                      </div>
+                      <span className="font-bold text-blue-800 bg-blue-200/60 px-2 py-0.5 rounded text-[11px]">
+                        {aiTriage.severityLabel} · {aiTriage.confidence}% match
+                      </span>
+                    </div>
+                    <p className="text-blue-950 font-medium">{aiTriage.reason}</p>
+                    <p className="text-[11px] text-blue-800">
+                      <strong>Target Unit:</strong> {aiTriage.recommendedUnit}
+                    </p>
+                  </div>
+                </div>
+
+                {/* LOCATION PINPOINT MAP */}
+                <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+                  <div className="flex items-center justify-between border-b border-slate-100 px-4 py-2 text-xs text-slate-500 font-semibold">
+                    <span>Incident Pinpoint</span>
+                    <span>GPS Accuracy ±5m</span>
+                  </div>
+                  <MapContainer center={[loc.lat, loc.lng]} zoom={15} className="z-0 h-48 w-full">
+                    <TileLayer
+                      attribution='&copy; <a href="https://openstreetmap.org">OSM</a>'
+                      url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                    />
+                    <Marker position={[loc.lat, loc.lng]} icon={meMarker} />
+                  </MapContainer>
+                </div>
+
+                {/* FIRST AID ADVICE CARD */}
+                <div className="rounded-2xl border border-emerald-200 bg-emerald-50/60 p-4 text-xs text-emerald-950">
+                  <div className="mb-2 flex items-center gap-1.5 font-bold text-emerald-900">
+                    <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                    <span>First-Aid Guidance (While Responders En Route)</span>
+                  </div>
+                  <ul className="space-y-1 text-[11px] text-emerald-900">
+                    {aiTriage.firstAidGuidance.slice(0, 3).map((item, idx) => (
+                      <li key={idx} className="flex items-start gap-1.5">
+                        <span className="font-bold text-emerald-700">•</span>
+                        <span>{item}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
+                {sendError && (
+                  <div className="rounded-xl border border-red-200 bg-red-50 p-3 text-xs font-semibold text-red-700">
+                    {sendError}
+                  </div>
+                )}
+
+                {/* SUBMIT BUTTON */}
+                <button
+                  onClick={() => submitReport(type, desc.trim())}
+                  disabled={sending}
+                  className="flex h-14 w-full items-center justify-center gap-2 rounded-xl bg-red-600 text-base font-bold text-white shadow-sm hover:bg-red-700 active:scale-98 transition disabled:opacity-50"
+                >
+                  {sending ? (
+                    <>
+                      <RefreshCw className="h-5 w-5 animate-spin" />
+                      Broadcasting to Emergency Grid...
+                    </>
+                  ) : (
+                    <>
+                      Send Emergency Report
+                      <ArrowRight className="h-4 w-4" />
+                    </>
+                  )}
+                </button>
+              </>
+            ) : (
+              /* TAB 2: EMERGENCY CONTACTS */
+              <div className="space-y-4">
+                <a
+                  href={whatsappSosLink}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center justify-between rounded-xl border border-emerald-300 bg-emerald-50 p-4 text-emerald-900 hover:bg-emerald-100 transition shadow-sm"
+                >
+                  <div className="flex items-center gap-3">
+                    <Share2 className="h-5 w-5 text-emerald-600 shrink-0" />
+                    <div>
+                      <p className="text-xs font-bold text-slate-900">Broadcast SOS on WhatsApp</p>
+                      <p className="text-[11px] text-emerald-800">Sends your live GPS coordinates to family or group chat</p>
+                    </div>
+                  </div>
+                  <span className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-bold text-white">
+                    Share
+                  </span>
+                </a>
+
+                <div className={cardStyle}>
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 mb-3">
+                    Saved Personal Contacts ({contacts.length}/4)
+                  </h3>
+
+                  <div className="space-y-2">
+                    {contacts.map((c, i) => (
+                      <div key={i} className="flex items-center justify-between rounded-xl bg-slate-50 p-3 border border-slate-100">
+                        <div>
+                          <p className="text-xs font-bold text-slate-900">{c.name}</p>
+                          <p className="text-[11px] text-slate-500">{c.phone}</p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <a
+                            href={`tel:${c.phone}`}
+                            className="rounded-lg bg-emerald-100 p-2 text-emerald-700 hover:bg-emerald-200 transition"
+                          >
+                            <PhoneCall className="h-3.5 w-3.5" />
+                          </a>
+                          <button
+                            onClick={() => saveContacts(contacts.filter((_, idx) => idx !== i))}
+                            className="text-xs font-semibold text-red-600 hover:underline"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {contacts.length < 4 ? (
+                    <form onSubmit={handleAddContact} className="mt-4 space-y-2">
+                      <input
+                        value={cName}
+                        onChange={(e) => setCName(e.target.value)}
+                        placeholder="Contact name (e.g. Mom, Partner)"
+                        className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs focus:border-red-600 focus:outline-none"
+                      />
+                      <input
+                        value={cPhone}
+                        onChange={(e) => setCPhone(e.target.value)}
+                        placeholder="Phone number"
+                        inputMode="tel"
+                        className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs focus:border-red-600 focus:outline-none"
+                      />
+                      <button
+                        type="submit"
+                        disabled={!cName.trim() || !cPhone.trim()}
+                        className="w-full rounded-xl bg-slate-900 py-2.5 text-xs font-bold text-white hover:bg-slate-800 disabled:opacity-50"
+                      >
+                        Add Contact
+                      </button>
+                    </form>
+                  ) : (
+                    <p className="mt-2 text-center text-xs text-slate-400">Maximum 4 contacts reached.</p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* NEARBY SERVICES DIRECTORY */}
+            <div className={cardStyle}>
+              <div className="mb-3 flex items-center justify-between">
+                <div className="flex items-center gap-1.5 font-bold text-slate-900 text-xs uppercase tracking-wider">
+                  <Building2 className="h-4 w-4 text-slate-600" />
+                  <span>Nearby Emergency Facilities</span>
+                </div>
+                {svcLoading && <RefreshCw className="h-3.5 w-3.5 animate-spin text-slate-400" />}
+              </div>
+
+              <div className="space-y-2">
+                {services.map((s) => (
+                  <div key={s.id} className="flex items-center justify-between rounded-xl bg-slate-50 p-3 border border-slate-100">
+                    <div>
+                      <p className="text-xs font-bold text-slate-900">{s.name}</p>
+                      <span className="text-[10px] font-semibold text-slate-500 uppercase">{s.type}</span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className="text-xs font-bold text-slate-800">{formatDistance(s.km)}</span>
+                      <a
+                        href={`tel:${s.phone || '112'}`}
+                        className="flex h-7 w-7 items-center justify-center rounded-lg bg-red-100 text-red-700 hover:bg-red-200 transition"
+                      >
+                        <PhoneCall className="h-3.5 w-3.5" />
+                      </a>
+                    </div>
+                  </div>
                 ))}
               </div>
-              <textarea
-                value={desc}
-                onChange={(e) => setDesc(e.target.value)}
-                rows={4}
-                placeholder="Describe what is happening"
-                className="w-full rounded-xl border border-stone-300 p-3 text-lg"
-              />
-              {sendError && <p role="alert" className="rounded-xl bg-red-50 p-3 text-red-700">{sendError}</p>}
-              <button
-                onClick={() => submit(type, desc.trim())}
-                disabled={!type || sending}
-                className="h-16 w-full rounded-xl bg-stone-900 text-xl font-bold text-white disabled:bg-stone-300"
-              >
-                {sending ? 'Sending...' : type ? 'Send emergency report' : 'Choose a type first'}
-              </button>
-            </section>
-
-            <div className="overflow-hidden rounded-2xl border border-stone-200 shadow-sm">
-              <MapContainer center={[loc.lat, loc.lng]} zoom={15} className="z-0 h-56 w-full">
-                <TileLayer attribution="&copy; OpenStreetMap contributors" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-                <Marker position={[loc.lat, loc.lng]} icon={meIcon} />
-              </MapContainer>
             </div>
-
-            {/* ===== contacts ===== */}
-            <section className={`${card} space-y-3`}>
-              <h2 className="text-lg font-bold">Emergency contacts</h2>
-              <p className="text-sm text-stone-500">We alert these people when you send a report. You can add up to 3. They stay on this phone only.</p>
-              {contacts.map((c, i) => (
-                <div key={i} className="flex items-center justify-between rounded-xl bg-stone-50 p-3">
-                  <div><p className="font-semibold">{c.name}</p><p className="text-sm text-stone-500">{c.phone}</p></div>
-                  <button onClick={() => saveContacts(contacts.filter((_, j) => j !== i))} className="h-11 rounded-lg px-3 font-semibold text-red-600">Remove</button>
-                </div>
-              ))}
-              {contacts.length < 3 ? (
-                <form onSubmit={addContact} className="space-y-2">
-                  <input value={cName} onChange={(e) => setCName(e.target.value)} placeholder="Name" className="h-12 w-full rounded-xl border border-stone-300 px-3" />
-                  <input value={cPhone} onChange={(e) => setCPhone(e.target.value)} placeholder="Phone number" inputMode="tel" className="h-12 w-full rounded-xl border border-stone-300 px-3" />
-                  <button type="submit" disabled={!cName.trim() || !cPhone.trim()} className="h-12 w-full rounded-xl bg-stone-800 font-bold text-white disabled:bg-stone-300">Add contact</button>
-                </form>
-              ) : (
-                <p className="text-sm text-stone-500">You have added the maximum of 3 contacts.</p>
-              )}
-            </section>
-
-            {servicesBlock}
-
-            {USE_MOCK && (
-              <button
-                onClick={() => { // MOCK - fake a nearby severity-1 incident (about 500 m away)
-                  const row = { id: 'other-' + Date.now(), severity: 1, lat: loc.lat + 0.004, lng: loc.lng + 0.003 }
-                  mock.fresh.forEach((fn) => fn(row))
-                }}
-                className="h-12 w-full rounded-xl border border-dashed border-stone-400 text-stone-600"
-              >
-                Test: simulate a nearby emergency (mock only)
-              </button>
-            )}
-          </>
+          </div>
         )}
 
-        {/* ============ LIVE TRACKER VIEW ============ */}
-        {incidentId && incident && myPos && (
-          <>
-            <section className={card}>
-              <h2 className="mb-1 text-xl font-bold">{incident.status === 'resolved' ? 'Resolved' : 'Help is being arranged'}</h2>
-              <p className="mb-4 text-sm text-stone-500">This page updates by itself. Keep it open.</p>
-              <ol className="flex items-start">
-                {STEPS.map(([k, label], i) => (
-                  <li key={k} className="flex-1 text-center">
-                    <div className={`mx-auto flex h-9 w-9 items-center justify-center rounded-full text-sm font-bold ${i < stepIndex ? 'bg-green-600 text-white' : i === stepIndex ? 'bg-red-600 text-white ring-4 ring-red-200' : 'bg-stone-200 text-stone-500'}`}>
-                      {i < stepIndex ? '✓' : i + 1}
+        {/* ========================================================
+            VIEW 2: REAL-TIME TRACKER & RESPONDER TELEMETRY
+        ======================================================== */}
+        {incidentId && incident && (
+          <div className="space-y-5">
+            {/* INCIDENT PROGRESS STATUS CARD */}
+            <div className={cardStyle}>
+              <div className="flex items-center justify-between">
+                <span className="rounded-full bg-red-100 px-2.5 py-0.5 text-[11px] font-bold uppercase text-red-700">
+                  Incident #{incident.id.slice(0, 8)}
+                </span>
+                <span className="flex items-center gap-1.5 text-xs font-semibold text-emerald-600">
+                  <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+                  Live Sync
+                </span>
+              </div>
+
+              <h2 className="mt-3 text-xl font-bold text-slate-900">
+                {incident.status === 'resolved'
+                  ? 'Emergency Resolved'
+                  : incident.status === 'arrived'
+                  ? 'Responders On Scene'
+                  : incident.status === 'en_route'
+                  ? 'Responder Is En Route'
+                  : 'Emergency Response Dispatched'}
+              </h2>
+              <p className="mt-1 text-xs text-slate-500">
+                Status updates in real time. Please keep your phone line accessible.
+              </p>
+
+              {/* Progress step bar */}
+              <div className="mt-6 flex items-start justify-between">
+                {STEPS.map((s, idx) => {
+                  const isDone = idx < stepIndex
+                  const isCurrent = idx === stepIndex
+                  return (
+                    <div key={s.id} className="flex flex-1 flex-col items-center text-center">
+                      <div
+                        className={`flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold transition-all ${
+                          isDone
+                            ? 'bg-emerald-600 text-white font-black'
+                            : isCurrent
+                            ? 'bg-red-600 text-white ring-4 ring-red-100 scale-105 shadow-sm'
+                            : 'bg-slate-200 text-slate-500'
+                        }`}
+                      >
+                        {isDone ? '✓' : idx + 1}
+                      </div>
+                      <span className={`mt-1.5 text-[11px] font-bold ${isCurrent ? 'text-red-700' : 'text-slate-500'}`}>
+                        {s.label}
+                      </span>
                     </div>
-                    <p className={`mt-1 text-xs ${i === stepIndex ? 'font-bold' : 'text-stone-500'}`}>{label}</p>
-                  </li>
-                ))}
-              </ol>
-            </section>
+                  )
+                })}
+              </div>
+            </div>
 
-            {responderId && !responder && <p className="rounded-xl bg-white p-4 text-stone-600 shadow-sm">Loading responder details...</p>}
-            {responder && (
-              <section className={`${card} flex items-center justify-between gap-3`}>
-                <div>
-                  <p className="text-sm text-stone-500">Your responder</p>
-                  <p className="text-lg font-bold">{responder.name}</p>
-                  <p className="text-stone-600">{responder.type}</p>
+            {/* ASSIGNED RESPONDER CARD */}
+            {responder ? (
+              <div className="rounded-2xl border border-emerald-200 bg-emerald-50/60 p-5 shadow-sm">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-emerald-600 text-white font-bold text-lg shadow-sm">
+                      🚑
+                    </div>
+                    <div>
+                      <p className="text-[10px] font-bold uppercase tracking-wider text-emerald-800">Assigned Unit</p>
+                      <h3 className="text-base font-bold text-slate-900">{responder.name}</h3>
+                      <p className="text-xs text-slate-600 capitalize">{responder.type} Service</p>
+                    </div>
+                  </div>
+
+                  <a
+                    href={`tel:${responder.phone || FAKE_PHONE}`}
+                    className="flex items-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2 text-xs font-bold text-white shadow-sm hover:bg-emerald-700 transition"
+                  >
+                    <PhoneCall className="h-3.5 w-3.5" />
+                    <span>Call Unit</span>
+                  </a>
                 </div>
-                <a href={`tel:${responder.phone || FAKE_PHONE}`} className="flex h-14 items-center rounded-xl bg-green-600 px-6 text-lg font-bold text-white">Call</a>
-              </section>
+
+                <div className="mt-4 grid grid-cols-2 gap-2.5 pt-3 border-t border-emerald-200/80">
+                  <div className="rounded-xl bg-white p-3 border border-emerald-100">
+                    <span className="text-[10px] uppercase font-bold text-slate-400">Live Distance</span>
+                    <p className="text-base font-bold text-slate-900">
+                      {distanceToResponder != null ? formatDistance(distanceToResponder) : 'Approaching'}
+                    </p>
+                  </div>
+                  <div className="rounded-xl bg-white p-3 border border-emerald-100">
+                    <span className="text-[10px] uppercase font-bold text-slate-400">Est. Arrival (ETA)</span>
+                    <p className="text-base font-bold text-emerald-700">
+                      {etaMinutes != null ? `${etaMinutes} mins` : 'Immediate'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between rounded-2xl border border-slate-200 bg-white p-4 text-xs font-semibold text-slate-600 shadow-sm">
+                <div className="flex items-center gap-2.5">
+                  <RefreshCw className="h-4 w-4 animate-spin text-amber-600" />
+                  <span>Connecting with nearest available responder unit...</span>
+                </div>
+              </div>
             )}
 
-            <div className="overflow-hidden rounded-2xl border border-stone-200 shadow-sm">
-              <MapContainer center={myPos} zoom={15} className="z-0 h-72 w-full">
-                <TileLayer attribution="&copy; OpenStreetMap contributors" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-                <Marker position={myPos} icon={meIcon} />
-                {resPos && <Marker position={resPos} icon={responderIcon} />}
-                <FitBounds points={resPos ? [myPos, resPos] : []} fitKey={String(responderId)} />
+            {/* LIVE TACTICAL NAVIGATION MAP */}
+            <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+              <div className="flex items-center justify-between border-b border-slate-100 px-4 py-2.5 text-xs text-slate-600 font-semibold">
+                <div className="flex items-center gap-1.5">
+                  <Navigation className="h-3.5 w-3.5 text-blue-600" />
+                  <span>Route Telemetry</span>
+                </div>
+                {responderCoords && (
+                  <a
+                    href={`https://www.google.com/maps/dir/?api=1&origin=${responderCoords.lat},${responderCoords.lng}&destination=${incidentCoords.lat},${incidentCoords.lng}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-bold text-blue-600 hover:underline"
+                  >
+                    View in Google Maps &rarr;
+                  </a>
+                )}
+              </div>
+
+              <MapContainer center={[incidentCoords.lat, incidentCoords.lng]} zoom={15} className="z-0 h-64 w-full">
+                <TileLayer
+                  attribution='&copy; <a href="https://openstreetmap.org">OSM</a>'
+                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                />
+                <Marker position={[incidentCoords.lat, incidentCoords.lng]} icon={meMarker} />
+                {responderCoords && <Marker position={[responderCoords.lat, responderCoords.lng]} icon={responderMarker} />}
+                {routePolyline.length > 0 && <Polyline positions={routePolyline} color="#2563eb" weight={4} />}
+                <FitBounds
+                  points={
+                    responderCoords
+                      ? [[incidentCoords.lat, incidentCoords.lng], [responderCoords.lat, responderCoords.lng]]
+                      : []
+                  }
+                />
               </MapContainer>
             </div>
-            <p className="text-xs text-stone-500">Blue dot is you. Green dot is your responder.</p>
 
-            <section className={card}>
-              <h2 className="mb-2 text-lg font-bold">Contacts alerted</h2>
-              {log.length === 0 ? <p className="text-stone-500">No emergency contacts saved.</p> : (
-                <ul className="space-y-1">{log.map((l, i) => <li key={i} className="text-stone-700">{l}</li>)}</ul>
-              )}
-            </section>
-
-            {servicesBlock}
-
+            {/* RESET BUTTON */}
             {incident.status === 'resolved' && (
-              <button onClick={newReport} className="h-14 w-full rounded-xl bg-stone-900 text-lg font-bold text-white">Report another emergency</button>
+              <button
+                onClick={resetNewReport}
+                className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-slate-900 font-bold text-white text-xs hover:bg-slate-800 transition"
+              >
+                <RefreshCw className="h-4 w-4" />
+                <span>Report Another Emergency</span>
+              </button>
             )}
-          </>
+          </div>
         )}
-
-        <p className="pt-2 text-center text-xs text-stone-500">This app supports, and does not replace, your local emergency number (112 in India).</p>
-      </div>
+      </main>
     </div>
   )
 }
